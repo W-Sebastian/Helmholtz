@@ -1,3 +1,5 @@
+from operator import itemgetter
+
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import List
@@ -124,12 +126,17 @@ class Coord1d:
 class Element1d:
     def __init__(self, first_node, second_node):
         self.nodes = [first_node, second_node]
-        self.p_nodes = []
+
         self.p_fem = 1
-        self.p_fem_index = 0
+        # When p_fem is higher than 1 then we also need
+        # a start idx for internal DOFs
+        self.interior_dofs_start_id = 0
 
     def set_p_fem(self, order: int):
         self.p_fem = order
+
+    def internal_dof_indices(self):
+        return list(range(self.interior_dofs_start_id, self.interior_dofs_start_id + self.p_fem - 1, 1))
 
     def __str__(self):
         return "[{}, {}]".format(self.nodes[0], self.nodes[1])
@@ -152,6 +159,15 @@ class Mesh1d:
     def num_dofs(self):
         return sum(element.num_p_fem_dofs() for element in self.elements) + len(self.node_coordinates)
 
+    def generate_internal_dof_indices(self):
+        last_idx = len(self.node_coordinates)
+        for element in self.elements:
+            if element.p_fem == 1:
+                continue
+
+            element.interior_dofs_start_id = last_idx
+            last_idx += (element.p_fem - 1)
+
     def __str__(self):
         return "{}\n{}".format(self.node_coordinates, self.elements)
 
@@ -173,10 +189,6 @@ def create_1d_mesh(length, num_elements):
     for i in range(0, len(coordinates) - 1):
         mesh.elements.append(Element1d(i, i + 1))
     return mesh
-
-
-def create_p_fem_interior_dofs(mesh: Mesh1d, element: Element1d, p_fem: int):
-    pass
 
 
 # Defines the gauss quadrature; the gauss quadrature contains n-points and n-weights such as
@@ -218,7 +230,7 @@ def gauss_legendre_quadrature(x1: float, x2: float, function_order: int):
 #
 # Returns the gauss quadrature for that order
 # The results of this functions could potentially be hardcoded for all orders and all element types
-# as long as they are always computed in ideal space of [-1; 1] coordinates.
+# as long as they are always computed in ideal space of [-1, 1] coordinates.
 # We don't necessary have a performance concern for 1D cases so we compute always and each time
 # There are multiple ways of computing this quadrature but what we actually need to find out is the roots
 # of the polynomial of the specified order and their weights;
@@ -265,7 +277,7 @@ def write_hardcoded_gauss_quadrature_points():
 
 
 def element_mass_stiffness_matrices(mesh: Mesh1d, element: Element1d):
-    p_fem_order = element.p_fem  # p-fem order is saved in the element itself
+    p_fem_order = element.p_fem
 
     Ke = np.zeros((p_fem_order + 1, p_fem_order + 1))
     Me = np.zeros((p_fem_order + 1, p_fem_order + 1))
@@ -306,7 +318,7 @@ def element_mass_stiffness_matrices(mesh: Mesh1d, element: Element1d):
 
 def apply_robin_boundary_condition(Matrix, beta, omega, c0, node_indices):
     indices = np.array(node_indices)
-    Matrix[indices[:, None], indices] += 1j * omega / c0 * beta
+    Matrix[indices[:, None], indices] += 1j * (omega / c0) * beta
 
 
 def create_velocity_load(velocity, num_system_dofs, load_indices):
@@ -324,8 +336,6 @@ def assemble_matrix(mesh: Mesh1d, omega: float, c0: float):
     wavelength = omega / c0
     Matrix = np.zeros((num_dofs, num_dofs), dtype=np.complex)
 
-    # we keep track of the p-fem rows and columns because we create DOFs which don't really exist
-    last_index = len(mesh.node_coordinates)
     for element in mesh.elements:
         # get element mass and stiffness matrix for assembly
         Me, Ke = element_mass_stiffness_matrices(mesh, element)
@@ -333,36 +343,11 @@ def assemble_matrix(mesh: Mesh1d, omega: float, c0: float):
         # set the element dofs first and then treat the p-fem dofs
         indices = np.array(element.nodes)
         if element.num_p_fem_dofs() > 0:
-            indices = np.append(indices, range(last_index, last_index + element.num_p_fem_dofs()))
-        last_index += element.num_p_fem_dofs()
+            indices = np.append(indices, element.internal_dof_indices())
 
         Matrix[indices[:, None], indices] += Ke - wavelength ** 2 * Me
 
     return Matrix
-
-
-def assemble_mass_stiffness_matrices(mesh: Mesh1d, omega: float, c0: float):
-    num_dofs = mesh.num_dofs()
-
-    K = np.zeros((num_dofs, num_dofs), dtype=np.complex)
-    M = np.zeros((num_dofs, num_dofs), dtype=np.complex)
-
-    # we keep track of the p-fem rows and columns because we create DOFs which don't really exist
-    last_index = len(mesh.node_coordinates)
-    for element in mesh.elements:
-        # get element mass and stiffness matrix for assembly
-        Me, Ke = element_mass_stiffness_matrices(mesh, element)
-
-        # set the element dofs first and then treat the p-fem dofs
-        indices = np.array(element.nodes)
-        if element.num_p_fem_dofs() > 0:
-            indices = np.append(indices, range(last_index, last_index + element.num_p_fem_dofs()))
-        last_index += element.num_p_fem_dofs()
-
-        K[indices[:, None], indices] += Ke
-        M[indices[:, None], indices] += (1 / c0 ** 2 * Me)
-
-    return M, K
 
 
 def test_matrix_stiffness_mass_one_element():
@@ -378,78 +363,290 @@ def test_matrix_stiffness_mass_one_element():
 #   A is our system matrix
 #   B is the rhs matrix
 def solve_system_matrix(system_matrix, rhs):
-    return solve_mldivide(system_matrix, rhs)
+    s = solve_mldivide(system_matrix, rhs)
+    return np.array([np.complex(x) for x in s])
+
+
+def interpolate_in_element_ri(element: Element1d, data: List[np.complex], position, order):
+    if order > element.p_fem:
+        raise Exception('Requested order higher than element order')
+
+    u1 = data[element.nodes[0]]
+    u2 = data[element.nodes[1]]
+
+    sf, _ = lobatto_shape_function(position, element.p_fem)
+
+    v = 0
+    v += u1 * sf[0]
+    v += u2 * sf[1]
+
+    if order > 1:
+        internal_indices = element.internal_dof_indices()
+        for idx, dataIdx in enumerate(internal_indices):
+            d = data[dataIdx]
+
+            v += d * sf[idx + 2]
+
+    return v
+
+
+def interpolate_in_element_mp(element: Element1d, data: List[np.complex], position, order):
+    if order > element.p_fem:
+        raise Exception('Requested order higher than element order')
+
+    u1 = data[element.nodes[0]]
+    u2 = data[element.nodes[1]]
+
+    u1_mag = np.abs(u1)
+    u1_phase = np.angle(u1)
+    u2_mag = np.abs(u2)
+    u2_phase = np.angle(u2)
+
+    sf, _ = lobatto_shape_function(position, element.p_fem)
+
+    v_mag = u1_mag * sf[0]
+    v_phase = u1_phase * sf[0]
+
+    v_mag += u2_mag * sf[1]
+    v_phase += u2_phase * sf[1]
+
+    if order > 1:
+        internal_indices = element.internal_dof_indices()
+        for idx, dataIdx in enumerate(internal_indices):
+            d = data[dataIdx]
+            d_mag = np.abs(d)
+            d_phase = np.angle(d)
+
+            v_mag += d_mag * sf[idx + 2]
+            v_phase += d_phase * sf[idx + 2]
+
+    return v_mag * np.exp(1j*v_phase)
+
+
+def interpolate_higher_order_solution(mesh: Mesh1d, data: List[np.complex], num_extra_points_per_element):
+    values_at_positions = []
+
+    # First add all the values from results that are on the nodes
+
+    for idx, coordinate in enumerate(mesh.node_coordinates):
+        values_at_positions.append((coordinate.x, np.complex(data[idx])))
+
+    if num_extra_points_per_element > 0:
+        # Generate the interpolation positions in the ideal element
+        ideal_positions = np.linspace(-1, 1, num_extra_points_per_element + 2)
+        ideal_positions = ideal_positions[1:-1]
+
+        # Now interpolate inside the element and add those values too
+        for idx, element in enumerate(mesh.elements):
+            x1 = mesh.node_coordinates[element.nodes[0]]
+            x2 = mesh.node_coordinates[element.nodes[1]]
+
+            positions = np.linspace(x1.x, x2.x, num_extra_points_per_element + 2)
+            # first and last position is for the nodes themselves so we can ignore that
+            positions = positions[1:-1]
+            values = [
+                interpolate_in_element_ri(element, data, xi, element.p_fem)
+                for xi in ideal_positions
+            ]
+            values_at_positions.extend((x, np.complex(v)) for (x, v) in zip(positions, values))
+
+    # sort values based on coordinate
+    values_at_positions.sort(key=lambda coord: coord[0])
+    x = [a[0] for a in values_at_positions]
+    y = [a[1] for a in values_at_positions]
+    return np.array(x), np.array(y)
+
+
+# Models a velocity load applied on a single node at a certain frequency
+class VelocityLoad:
+    def __init__(self, omega, velocity, node_index):
+        self.omega = omega
+        self.velocity = velocity
+        self.node_index = node_index
+
+
+# Models an Impedance boundary condition on a certain node
+# beta parameters goes from 0 (reflective) to 1 (full admittance)
+# beta is defined as acoustic resistance (R) over rho*c (mass density * speed of sound)
+class Impedance:
+    def __init__(self, beta, node_index):
+        self.impedance_values = {node_index: beta}
+
+    def add_impedance(self, beta, node_index):
+        self.impedance_values[node_index] = beta
+
+
+# Defines the fluid properties in terms of mass density and speed of sound
+class FluidProperties:
+    def __init__(self, rho, c):
+        self.rho = rho
+        self.c = c
+
+
+class ComputationParameters:
+    def __init__(self, femao_max_order=1):
+        self.p_fem = femao_max_order
+
+
+class HelmholtzSimulation:
+    def __init__(self, mesh=None, load=None, impedance=None, fluid_properties=None):
+        self.mesh: Mesh1d = mesh
+        self.load: VelocityLoad = load
+        self.impedance: Impedance = impedance
+        self.fluid_properties: FluidProperties = fluid_properties
+
+    def set_mesh(self, mesh: Mesh1d):
+        self.mesh = mesh
+
+    def set_load(self, load: VelocityLoad):
+        self.load = load
+
+    def set_impedance(self, impedance: Impedance):
+        self.impedance = impedance
+
+    def set_fluid_properties(self, fluid_properties: FluidProperties):
+        self.fluid_properties = fluid_properties
+
+    def compute(self, computation_settings: ComputationParameters = None):
+        if computation_settings is None:
+            computation_settings = ComputationParameters()  # initialize with default settings
+
+        # Validate that we have everything we need
+        if self.mesh is None:
+            raise Exception('Computation requires a valid mesh!')
+        if self.load is None:
+            raise Exception('Computation requires a load!')
+        if self.fluid_properties is None:
+            raise Exception('Computation requires fluid properties!')
+
+        # setup FEMAO
+        for element in self.mesh.elements:
+            element.p_fem = computation_settings.p_fem
+        self.mesh.generate_internal_dof_indices()
+
+        # assemble the system matrix
+        system_matrix = assemble_matrix(self.mesh, self.load.omega, self.fluid_properties.c)
+
+        # if needed, setup the impedance boundary conditions as a robin BC
+        if self.impedance is not None:
+            for k, v in self.impedance.impedance_values.items():
+                apply_robin_boundary_condition(system_matrix,
+                                               v, self.load.omega, self.fluid_properties.c, [k])
+
+        # impose the velocity on the right hand side of the equation
+        rhs = create_velocity_load(self.load.velocity, len(system_matrix), [self.load.node_index])
+
+        # solve for the system matrix and RHS
+        solution = solve_system_matrix(system_matrix, rhs)
+
+        return solution
 
 
 def compute_duct_problem():
-    for p_fem in [2]:
-        num_elements = 6
-        length = 2
+    plot_ri = True
+    plot_mp = False
+    plot_sol = False
 
-        omega = np.pi
-        c0 = 1
-        rho0 = 1
+    # Create the mesh
+    num_elements = 24
+    length = 2
+    mesh = create_1d_mesh(length, num_elements)
 
-        beta = 1
-        Vn = 1 / (rho0 * c0)
+    # Setup the fluid properties
+    rho0 = 1
+    c0 = 1
+    fluid_properties = FluidProperties(rho0, c0)
 
-        mesh = create_1d_mesh(length, num_elements)
+    # Setup load parameters
+    omega = 10*np.pi
+    Vn = 1 / (rho0 * c0)
+    load = VelocityLoad(omega, velocity=1j * omega * rho0 * Vn, node_index=0)
 
-        for element in mesh.elements:
-            element.p_fem = p_fem
+    # Setup impedance condition
+    beta = 0.1
+    impedance = Impedance(beta, node_index=len(mesh.node_coordinates) - 1)
+    # impedance.add_impedance(1, 0)
 
-        system_matrix = assemble_matrix(mesh, omega, c0)
+    # Create the simulation
+    sim = HelmholtzSimulation(mesh, load, impedance, fluid_properties)
 
-        # apply robin boundary condition on the last node; this is modeling acoustic impedance
-        apply_robin_boundary_condition(system_matrix, beta, omega, c0, [len(mesh.node_coordinates) - 1])
+    for p_fem in [8]:
 
-        # apply a velocity load on the first node
-        rhs = create_velocity_load(1j * omega * rho0 * Vn, len(system_matrix), [0])
+        solution = sim.compute(ComputationParameters(p_fem))
 
-        # solve the system matrix with the created load
+        x, y = interpolate_higher_order_solution(mesh, solution, 100)
 
-        solution = solve_system_matrix(system_matrix, rhs)
+        y_real = [np.real(yi) for yi in y]
+        y_imag = [np.imag(yi) for yi in y]
+        y_mag = [np.absolute(yi) for yi in y]
+        y_phase = [np.angle(yi) for yi in y]
 
-        sine_lobatto = [np.imag(x) for x in solution[0:, 0]]
-        print(sine_lobatto)
+        max_n = len(mesh.node_coordinates)
+        xs_real = np.linspace(0, length, max_n)
+        ys_real = [np.real(yis) for yis in solution[0:max_n]]
+        ys_imag = [np.imag(yis) for yis in solution[0:max_n]]
+        ys_mag = [np.abs(yis) for yis in solution[0:max_n]]
+        ys_phase = [np.angle(ym) for ym in solution[0:max_n]]
 
-        # Convert the solution to real space with lobatto shape functions
-        # interpolate the solution on range between -1 and 1
-        num_interpolation_points = 100  # might be too much?
-        xi = np.array([-1, 1])
+        reference_args = np.linspace(0, length, 100)
+        c = (omega*rho0 * Vn) / ((omega/c0)*beta)
+        reference_function = np.exp(-1j * omega * reference_args)
+        # reference_function = c * np.exp(-1j * omega * reference_args)
 
-        x = np.array([c.x for c in mesh.node_coordinates])
-        y_real = [np.real(x) for x in solution[0:len(mesh.node_coordinates), 0]]
-        y_imag = [np.imag(x) for x in solution[0:len(mesh.node_coordinates), 0]]
-        y_mag = [np.absolute(x) for x in solution[0:len(mesh.node_coordinates), 0]]
-        # do some rounding to get rid of pesky floating point errors
-        y_mag = [np.round(x, 1) for x in y_mag]
-        reference_function = np.exp(-1j * omega * x)
+        # Real Imaginary plots
 
         plt.style.use('seaborn-darkgrid')
-        fig, axs = plt.subplots(3, 1, figsize=(9, 6))
+        if plot_ri:
+            fig, axs = plt.subplots(2, 1, figsize=(9, 6))
+            plt.ticklabel_format(useOffset=False)
+            axs[0].set_title('p-fem={}; {} elements; L={}m; beta={}; omega={:.2f}Hz\n\n'.format(
+                p_fem, num_elements, length, beta, omega), fontsize=12)
+            axs[0].plot(x, y_real)
+            if plot_sol:
+                axs[0].plot(xs_real, ys_real,  linestyle='-', marker='o')
+            axs[0].plot(reference_args, np.real(reference_function), linestyle=':', marker='+')
+            axs[0].set_xlabel('duct length(m)')
+            axs[0].set_ylabel('pressure (real)')
 
-        plt.ticklabel_format(useOffset=False)
-        axs[0].plot(x, y_real)
-        axs[0].plot(x, np.real(reference_function), linestyle=':', marker='+')
-        axs[0].set_xlabel('duct length(m)')
-        axs[0].set_ylabel('pressure (real)')
+            axs[1].plot(x, y_imag)
+            if plot_sol:
+                axs[1].plot(xs_real, ys_imag,  linestyle='-', marker='o')
+            axs[1].plot(reference_args, np.imag(reference_function), linestyle=':', marker='+')
+            axs[1].set_xlabel('duct length(m)')
+            axs[1].set_ylabel('pressure (imaginary)')
+            if plot_sol:
+                fig.legend(['Helmholtz', 'Solution', 'Reference'])
+            else:
+                fig.legend(['Helmholtz', 'Reference'])
+            fig.tight_layout()
+            fig.show()
 
-        axs[1].plot(x, y_imag)
-        axs[1].plot(x, np.imag(reference_function), linestyle=':', marker='+')
-        axs[1].set_xlabel('duct length(m)')
-        axs[1].set_ylabel('pressure (imaginary)')
+        # Magnitude/Phase plots
+        if plot_mp:
+            fig, axs = plt.subplots(2, 1, figsize=(9, 6))
+            plt.ticklabel_format(useOffset=False)
+            axs[0].set_title('p-fem={}; {} elements; L={}m; beta={}; omega={:.2f}Hz\n\n'.format(
+                p_fem, num_elements, length, beta, omega), fontsize=12)
+            axs[0].plot(x, y_mag)
+            if plot_sol:
+                axs[0].plot(xs_real, ys_mag, linestyle='-', marker='o')
+            ref_mag = [np.absolute(i) for i in reference_function]
+            axs[0].plot(reference_args, ref_mag, linestyle=':')
+            axs[0].set_xlabel('duct length(m)')
+            axs[0].set_ylabel('pressure (magnitude)')
 
-        axs[2].plot(x, y_mag)
-        axs[2].plot(x, np.absolute(reference_function), linestyle=':', marker='+')
-        axs[2].set_xlabel('duct length(m)')
-        axs[2].set_ylabel('pressure (magnitude)')
-
-        fig.legend(['Helmholtz', 'Reference'])
-        fig.suptitle('p-fem={} with {} elements and L={}; beta={}'.format(
-            p_fem, num_elements, length, beta), fontsize=12)
-        fig.tight_layout()
-        fig.show()
+            axs[1].plot(x, y_phase)
+            if plot_sol:
+                axs[1].plot(xs_real, ys_phase, linestyle='-', marker='o')
+            axs[1].plot(reference_args, np.angle(reference_function), linestyle=':')
+            axs[1].set_xlabel('duct length(m)')
+            axs[1].set_ylabel('pressure (phase)')
+            if plot_sol:
+                fig.legend(['Helmholtz', 'Solution', 'Reference'])
+            else:
+                fig.legend(['Helmholtz', 'Reference'])
+            fig.tight_layout()
+            fig.show()
 
         # M, K = assemble_mass_stiffness_matrices(mesh, omega, c0)
         # eigvals, eigvecs = eigh(K, M, eigvals_only=False)
@@ -473,19 +670,20 @@ def plot_sf_comparison():
     L1 = 2
 
     def target_function(arg):
-        # return np.sin(np.pi * arg)
+        return np.sin(np.pi * arg)
         # return arg**2
-        return arg
+        # return arg
 
     x = np.linspace(L0, L1, 100)
     y = target_function(x)
-    plt.plot(x, y)  # reference function
 
-    legend_labels = ['reference']
+    # plt.plot(x, y)  # reference function
+    # legend_labels = ['reference']
+    legend_labels = []
 
-    order = 2
+    order = 1
 
-    for i in [1]:
+    for i in range(2, 11):
         num_elements = i
 
         coords = np.linspace(L0, L1, num_elements + 1 + (order - 1) * num_elements)
@@ -526,15 +724,17 @@ def plot_sf_comparison():
             interpolated_coords.extend(locations)
             interpolated_values.extend(values)
 
-        legend_labels.append('{} elements'.format(num_elements))
+        legend_labels.append('{} elemente'.format(num_elements))
         plt.plot(interpolated_coords, interpolated_values)
 
     plt.style.use('seaborn-darkgrid')
-    plt.title('Shape functions interpolation for order {}'.format(order))
+    # plt.title('Shape functions interpolation for order {}'.format(order))
+    plt.xlabel('x')
+    plt.ylabel('y')
     plt.legend(legend_labels)
     plt.show()
 
 
 if __name__ == "__main__":
-    compute_duct_problem()
-    # plot_sf_comparison()
+    # compute_duct_problem()
+    plot_sf_comparison()

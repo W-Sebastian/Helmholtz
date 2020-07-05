@@ -1,3 +1,8 @@
 .idea/
 .vs/
 venv/
+__pycache__/
+latex_images/
+plots/
+LX_Article/
+Article/
